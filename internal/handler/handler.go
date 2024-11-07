@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -35,6 +36,7 @@ func (h *InfoCenterHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
+
 func (h *InfoCenterHandler) handleSendMessage(w http.ResponseWriter, r *http.Request, topicName string) {
 	if r.ContentLength == 0 {
 		http.Error(w, "Message body cannot be empty", http.StatusBadRequest)
@@ -47,7 +49,11 @@ func (h *InfoCenterHandler) handleSendMessage(w http.ResponseWriter, r *http.Req
 		http.Error(w, "Failed to read message or message is empty", http.StatusBadRequest)
 		return
 	}
-	defer r.Body.Close()
+	defer func() {
+		if err := r.Body.Close(); err != nil {
+			log.Printf("Failed to close request body: %v", err)
+		}
+	}()
 
 	msg := message.Message{
 		ID:   h.ps.NextMessageID(),
@@ -55,24 +61,24 @@ func (h *InfoCenterHandler) handleSendMessage(w http.ResponseWriter, r *http.Req
 	}
 
 	const maxRetries = 5
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		topic.Mu.Lock()
-		if len(topic.Messages) >= pubsub.MaxMessages {
-			topic.Messages = topic.Messages[1:]
-		}
-		topic.Messages = append(topic.Messages, msg)
-		topic.Mu.Unlock()
+	if err := h.sendMessageWithRetry(topic, msg, maxRetries); err != nil {
+		http.Error(w, "Failed to send message after multiple attempts.", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
 
+func (h *InfoCenterHandler) sendMessageWithRetry(topic *pubsub.Topic, msg message.Message, maxRetries int) error {
+	baseDelay := 100 * time.Millisecond
+	for attempt := 0; attempt < maxRetries; attempt++ {
 		if err := pubsub.BroadcastMessage(topic, msg); err == nil {
-			w.WriteHeader(http.StatusNoContent)
-			return
+			return nil
 		} else {
-			log.Printf("Attempt %d failed with error: %v", attempt+1, err)
-			time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+			log.Printf("Broadcast attempt %d failed with error: %v", attempt+1, err)
+			time.Sleep(baseDelay * time.Duration(1<<attempt))
 		}
 	}
-
-	http.Error(w, "Failed to send message after multiple attempts.", http.StatusInternalServerError)
+	return errors.New("exceeded maximum retry attempts")
 }
 
 func (h *InfoCenterHandler) handleReceiveMessages(w http.ResponseWriter, r *http.Request, topicName string) {
@@ -93,7 +99,7 @@ func (h *InfoCenterHandler) handleReceiveMessages(w http.ResponseWriter, r *http
 	defer h.ps.RemoveSubscriber(topic, msgCh)
 
 	for _, msg := range topic.MessageQueue {
-		_, _ = w.Write([]byte("id: " + strconv.Itoa(msg.ID) + "\n"))
+		_, _ = w.Write([]byte("id: " + strconv.Itoa(int(msg.ID)) + "\n"))
 		_, _ = w.Write([]byte("event: msg\n"))
 		_, _ = w.Write([]byte("data: " + msg.Data + "\n\n"))
 		flusher.Flush()
@@ -105,7 +111,7 @@ func (h *InfoCenterHandler) handleReceiveMessages(w http.ResponseWriter, r *http
 	for {
 		select {
 		case msg := <-msgCh:
-			_, _ = w.Write([]byte("id: " + strconv.Itoa(msg.ID) + "\n"))
+			_, _ = w.Write([]byte("id: " + strconv.Itoa(int(msg.ID)) + "\n"))
 			_, _ = w.Write([]byte("event: msg\n"))
 			_, _ = w.Write([]byte("data: " + msg.Data + "\n\n"))
 			flusher.Flush()
@@ -113,7 +119,10 @@ func (h *InfoCenterHandler) handleReceiveMessages(w http.ResponseWriter, r *http
 			_, _ = w.Write([]byte("id: \nevent: timeout\n"))
 			_, _ = w.Write([]byte("data: 30s\n\n"))
 			flusher.Flush()
+			close(msgCh)
+			return
 		case <-r.Context().Done():
+			close(msgCh)
 			return
 		}
 	}
